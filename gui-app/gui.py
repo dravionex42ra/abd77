@@ -70,13 +70,17 @@ async def main():
             print("No valid indices selected.")
             return
             
-        batch_folder = os.path.splitext(filename)[0]
-        out_dir = os.path.join(OUT_BASE, batch_folder)
+        print(f"\n🎬 Archiving {len(indices)} videos to: {out_dir}")
+        print("\nChoose Download Mode:")
+        print("1. Multi (Parallel - Fast)")
+        print("2. Single (One by One - Safest)")
+        mode = input("Select mode (1/2) [Default 1]: ").strip() or "1"
         
-        print(f"🎬 Archiving {len(indices)} videos to: {out_dir}\n")
+        concurrency = 15 if mode == "1" else 1
+        print(f"🚀 Working in {'MULTI' if mode == '1' else 'SINGLE'} mode...")
         
         urls_to_download = [(idx, urls[idx-1]) for idx in indices]
-        engine = SoraCore(out_dir, concurrency=25)
+        engine = SoraCore(out_dir, concurrency=concurrency)
         await engine.archiver_run(urls_to_download)
         
     except ValueError: print("Please enter a valid number.")
