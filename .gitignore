@@ -1,0 +1,14 @@
+apidoc.md
+downloads/
+logs/
+__pycache__/
+*.pyc
+.env
+.git/
+node_modules/
+dist/
+build/
+.DS_Store
+*.zip
+*.tar.gz
+*.rar
