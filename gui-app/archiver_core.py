@@ -4,18 +4,18 @@ import asyncio
 import os
 import logging
 import urllib.parse
-from tqdm.asyncio import tqdm
+from datetime import datetime
 
 # Configure Logging
 os.makedirs('logs', exist_ok=True)
 logging.basicConfig(level=logging.INFO, filename='logs/archiver.log', format='%(asctime)s - %(levelname)s - %(message)s')
 
 class SoraAPI:
-    """Independent API logic for gui-app with retry support"""
+    """Independent API logic for gui-app with retry and timeout support"""
     BASE_URL = "https://api.soracdn.workers.dev/api-proxy/"
     
     @staticmethod
-    async def get_clean_link(session, sora_url, retries=3):
+    async def get_clean_link(session, sora_url, idx, retries=3):
         encoded_url = urllib.parse.quote(sora_url, safe='')
         target_url = f"{SoraAPI.BASE_URL}{encoded_url}"
         headers = {
@@ -26,18 +26,23 @@ class SoraAPI:
         
         for attempt in range(retries):
             try:
-                # Add tiny delay between API calls to prevent rate-limit
-                await asyncio.sleep(0.2)
+                # Small delay to prevent proxy rate-limit
+                await asyncio.sleep(0.1)
                 
-                async with session.get(target_url, headers=headers, timeout=15) as response:
-                    if response.status == 200:
-                        data = await response.json()
-                        links = data.get('links', {})
-                        return links.get('mp4_source') or links.get('mp4')
-            except Exception as e:
+                # Hard timeout for API fetch
+                async with asyncio.timeout(30):
+                    async with session.get(target_url, headers=headers) as response:
+                        if response.status == 200:
+                            data = await response.json()
+                            links = data.get('links', {})
+                            return links.get('mp4_source') or links.get('mp4')
+                        elif response.status == 429:
+                            print(f" [!] Rate Limited (# {idx}). Retrying in 5s...")
+                            await asyncio.sleep(5)
+            except Exception:
                 if attempt == retries - 1:
-                    print(f"\n⚠️ API Error (Max Retries): {e}")
-                await asyncio.sleep(2) # Wait before retry
+                    return None
+                await asyncio.sleep(3)
         return None
 
 class SoraCore:
@@ -48,61 +53,83 @@ class SoraCore:
 
     async def get_remote_size(self, session, url):
         try:
-            async with session.head(url, timeout=10) as r: 
-                return int(r.headers.get('Content-Length', 0))
+            async with asyncio.timeout(15):
+                async with session.head(url) as r: 
+                    return int(r.headers.get('Content-Length', 0))
         except: return 0
 
-    async def download_item(self, session, url, idx, retries=3):
-        """Downloads a single item with retry logic"""
-        for attempt in range(retries):
-            try:
-                clean_url = await SoraAPI.get_clean_link(session, url)
-                if not clean_url: continue
+    async def download_item(self, session, url, idx):
+        """Downloads a single item with hard timeout and verbose status"""
+        print(f" [+] [#{idx}] FETCHING LINK...")
+        
+        try:
+            clean_url = await SoraAPI.get_clean_link(session, url, idx)
+            if not clean_url:
+                print(f" [!] [#{idx}] FAILED TO FETCH CLEAN LINK.")
+                return False
                 
-                s_id = url.split('/')[-1] if '/p/' in url else f"item_{idx}"
-                filename = f"{idx}_{s_id}.mp4"
-                filepath = os.path.join(self.out_dir, filename)
+            s_id = url.split('/')[-1] if '/p/' in url else f"item_{idx}"
+            filename = f"{idx}_{s_id}.mp4"
+            filepath = os.path.join(self.out_dir, filename)
+            
+            # Smart duplicate check
+            size = await self.get_remote_size(session, clean_url)
+            if os.path.exists(filepath) and os.path.getsize(filepath) == size and size > 0:
+                print(f" [✔] [#{idx}] SKIPPED (Duplicate).")
+                return True
                 
-                # Smart duplicate check (Name + Size)
-                size = await self.get_remote_size(session, clean_url)
-                if os.path.exists(filepath) and os.path.getsize(filepath) == size and size > 0:
-                    return True
-                    
-                async with session.get(clean_url, timeout=120) as resp:
+            print(f" [⚡] [#{idx}] DOWNLOADING (Size: {size/(1024*1024):.1f} MB)...")
+            
+            # Hard timeout for file download
+            async with asyncio.timeout(300):
+                async with session.get(clean_url) as resp:
                     if resp.status == 200:
                         async with aiofiles.open(filepath, 'wb') as f:
                             async for chunk in resp.content.iter_chunked(1024*1024): 
                                 await f.write(chunk)
+                        print(f" [✅] [#{idx}] SUCCESSFULLY ARCHIVED.")
                         return True
-            except Exception as e:
-                if attempt == retries - 1:
-                    print(f"\n❌ Download Error (Max Retries): {e}")
-                await asyncio.sleep(3) # Wait before retry
-        return False
+                    else:
+                        print(f" [!] [#{idx}] SERVER RETURNED STATUS: {resp.status}")
+                        return False
+        except asyncio.TimeoutError:
+            print(f" [✖] [#{idx}] TIMED OUT (Skipping to next).")
+            return False
+        except Exception as e:
+            print(f" [✖] [#{idx}] ERROR: {e}")
+            return False
 
-    async def worker(self, queue, session, pbar):
-        """Worker that pulls tasks from the queue"""
+    async def worker(self, queue, session):
         while True:
             item = await queue.get()
             if item is None: break
             
             idx, url = item
-            await self.download_item(session, url, idx)
-            pbar.update(1)
-            queue.task_done()
+            try:
+                await self.download_item(session, url, idx)
+            finally:
+                queue.task_done()
 
     async def archiver_run(self, urls_with_indices):
-        """Main execution loop with Worker Pool & Queue"""
+        """Standard Terminal Output (No TQDM to avoid flickering)"""
         queue = asyncio.Queue()
         for item in urls_with_indices:
             await queue.put(item)
             
-        # Add termination flags for workers
         for _ in range(self.concurrency):
             await queue.put(None)
 
-        async with aiohttp.ClientSession() as session:
-            with tqdm(total=len(urls_with_indices), desc="Archiving Batch", leave=True) as pbar:
-                workers = [asyncio.create_task(self.worker(queue, session, pbar)) 
-                           for _ in range(self.concurrency)]
-                await asyncio.gather(*workers)
+        print(f"\n🚀 ARCHIVER STARTED | CONCURRENCY: {self.concurrency} | BATCH SIZE: {len(urls_with_indices)}")
+        print(f"📂 SAVING TO: {self.out_dir}")
+        print("-" * 50)
+
+        # Using a more robust connector for Termux/VPN
+        connector = aiohttp.TCPConnector(limit=self.concurrency, trust_env=True)
+        async with aiohttp.ClientSession(connector=connector) as session:
+            workers = [asyncio.create_task(self.worker(queue, session)) 
+                       for _ in range(self.concurrency)]
+            await asyncio.gather(*workers)
+        
+        print("\n" + "=" * 50)
+        print("🎉 BATCH PROCESSING COMPLETE!")
+        print("=" * 50)
