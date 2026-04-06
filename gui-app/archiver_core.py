@@ -29,7 +29,9 @@ class SoraAPI:
                     data = await response.json()
                     links = data.get('links', {})
                     return links.get('mp4_source') or links.get('mp4')
-        except: return None
+        except Exception as e:
+            print(f"\n⚠️ API Error: {e}")
+            return None
         return None
 
 class SoraCore:
@@ -63,7 +65,9 @@ class SoraCore:
                         async with aiofiles.open(filepath, 'wb') as f:
                             async for chunk in resp.content.iter_chunked(1024*1024): await f.write(chunk)
                         return True
-            except: return False
+            except Exception as e:
+                print(f"\n❌ Local Save Error: {e}")
+                return False
         return False
 
     async def archiver_run(self, urls_with_indices):
