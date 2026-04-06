@@ -123,9 +123,9 @@ class SoraCore:
         print(f"📂 SAVING TO: {self.out_dir}")
         print("-" * 50)
 
-        # Using a more robust connector for Termux/VPN
-        connector = aiohttp.TCPConnector(limit=self.concurrency, trust_env=True)
-        async with aiohttp.ClientSession(connector=connector) as session:
+        # Fix: trust_env belongs to ClientSession, not TCPConnector
+        connector = aiohttp.TCPConnector(limit=self.concurrency)
+        async with aiohttp.ClientSession(connector=connector, trust_env=True) as session:
             workers = [asyncio.create_task(self.worker(queue, session)) 
                        for _ in range(self.concurrency)]
             await asyncio.gather(*workers)
