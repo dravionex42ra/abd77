@@ -22,7 +22,6 @@
             justify-content: center;
             align-items: center;
             min-height: 100vh;
-            overflow-x: hidden;
             background: radial-gradient(circle at 50% 50%, #1e1b4b 0%, #0f172a 100%);
         }
 
@@ -35,7 +34,6 @@
             border-radius: 24px;
             padding: 40px;
             box-shadow: 0 25px 50px -12px rgba(0, 0, 0, 0.5);
-            animation: fadeIn 0.8s ease-out;
         }
 
         h1 {
@@ -51,7 +49,6 @@
             display: grid;
             grid-template-columns: 1fr 1fr;
             gap: 20px;
-            margin-bottom: 40px;
         }
 
         .stat-card {
@@ -60,12 +57,6 @@
             border-radius: 16px;
             padding: 20px;
             text-align: center;
-            transition: transform 0.3s ease;
-        }
-
-        .stat-card:hover {
-            transform: translateY(-5px);
-            border-color: var(--accent);
         }
 
         .stat-value {
@@ -80,10 +71,6 @@
             margin-top: 5px;
         }
 
-        .batch-list {
-            margin-top: 20px;
-        }
-
         .batch-item {
             display: flex;
             justify-content: space-between;
@@ -95,22 +82,11 @@
             margin-bottom: 10px;
         }
 
-        .batch-name {
-            font-weight: 500;
-            opacity: 0.9;
-        }
-
         .batch-count {
             background: var(--accent);
             padding: 4px 12px;
             border-radius: 20px;
             font-size: 0.8rem;
-            font-weight: 700;
-        }
-
-        @keyframes fadeIn {
-            from { opacity: 0; transform: translateY(20px); }
-            to { opacity: 1; transform: translateY(0); }
         }
 
         .refresh-btn {
@@ -123,18 +99,13 @@
             border-radius: 12px;
             font-weight: 700;
             cursor: pointer;
-            transition: opacity 0.3s;
             margin-top: 20px;
-        }
-
-        .refresh-btn:hover {
-            opacity: 0.8;
         }
     </style>
 </head>
 <body>
     <div class="container">
-        <h1>Sora Cloud Archiver</h1>
+        <h1>Sora Archive Monitor</h1>
         
         <div class="stats-grid">
             <div class="stat-card">
@@ -147,10 +118,8 @@
             </div>
         </div>
 
-        <h3>Active Batches</h3>
-        <div id="batch-container">
-            <!-- Batches will be injected here -->
-        </div>
+        <h3>Active Result Folders</h3>
+        <div id="batch-container"></div>
 
         <button class="refresh-btn" onclick="updateStats()">Refresh Dashboard</button>
     </div>
@@ -160,28 +129,19 @@
             try {
                 const response = await fetch('/api/stats');
                 const data = await response.json();
-                
                 document.getElementById('total-batches').innerText = data.total_batches;
                 document.getElementById('total-downloads').innerText = data.total_downloads;
                 
                 const container = document.getElementById('batch-container');
                 container.innerHTML = '';
-                
                 data.batches.forEach(batch => {
                     const item = document.createElement('div');
                     item.className = 'batch-item';
-                    item.innerHTML = `
-                        <span class="batch-name">${batch.name}</span>
-                        <span class="batch-count">${batch.count} files</span>
-                    `;
+                    item.innerHTML = `<span>${batch.name}</span><span class="batch-count">${batch.count} files</span>`;
                     container.appendChild(item);
                 });
-            } catch (e) {
-                console.error("Stats Fetch Error:", e);
-            }
+            } catch (e) { console.error("Fetch Error:", e); }
         }
-
-        // Auto-refresh every 5 seconds
         setInterval(updateStats, 5000);
         updateStats();
     </script>
