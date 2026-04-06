@@ -11,7 +11,7 @@ os.makedirs('logs', exist_ok=True)
 logging.basicConfig(level=logging.INFO, filename='logs/archiver.log', format='%(asctime)s - %(levelname)s - %(message)s')
 
 class SoraAPI:
-    """Independent API logic for gui-app with retry and timeout support"""
+    """Independent API logic for gui-app with deep error reporting"""
     BASE_URL = "https://api.soracdn.workers.dev/api-proxy/"
     
     @staticmethod
@@ -26,23 +26,23 @@ class SoraAPI:
         
         for attempt in range(retries):
             try:
-                # Small delay to prevent proxy rate-limit
-                await asyncio.sleep(0.1)
+                await asyncio.sleep(0.1) # Small delay to prevent proxy rate-limit
                 
-                # Hard timeout for API fetch
                 async with asyncio.timeout(30):
                     async with session.get(target_url, headers=headers) as response:
                         if response.status == 200:
                             data = await response.json()
                             links = data.get('links', {})
                             return links.get('mp4_source') or links.get('mp4')
-                        elif response.status == 429:
-                            print(f" [!] Rate Limited (# {idx}). Retrying in 5s...")
-                            await asyncio.sleep(5)
-            except Exception:
-                if attempt == retries - 1:
-                    return None
-                await asyncio.sleep(3)
+                        else:
+                            print(f" [!] [#{idx}] API Status Error: {response.status} (Attempt {attempt+1})")
+                            if response.status == 429: await asyncio.sleep(5)
+            except asyncio.TimeoutError:
+                print(f" [!] [#{idx}] API Timeout Error (Attempt {attempt+1})")
+            except Exception as e:
+                print(f" [!] [#{idx}] API Exception: {type(e).__name__} - {e} (Attempt {attempt+1})")
+                
+            await asyncio.sleep(3) # Wait before retry
         return None
 
 class SoraCore:
@@ -59,13 +59,13 @@ class SoraCore:
         except: return 0
 
     async def download_item(self, session, url, idx):
-        """Downloads a single item with hard timeout and verbose status"""
+        """Downloads a single item with chunk-by-chunk progress reporting"""
         print(f" [+] [#{idx}] FETCHING LINK...")
         
         try:
             clean_url = await SoraAPI.get_clean_link(session, url, idx)
             if not clean_url:
-                print(f" [!] [#{idx}] FAILED TO FETCH CLEAN LINK.")
+                print(f" [✖] [#{idx}] FAILED: Link fetch error.")
                 return False
                 
             s_id = url.split('/')[-1] if '/p/' in url else f"item_{idx}"
@@ -73,30 +73,37 @@ class SoraCore:
             filepath = os.path.join(self.out_dir, filename)
             
             # Smart duplicate check
-            size = await self.get_remote_size(session, clean_url)
-            if os.path.exists(filepath) and os.path.getsize(filepath) == size and size > 0:
-                print(f" [✔] [#{idx}] SKIPPED (Duplicate).")
+            total_size = await self.get_remote_size(session, clean_url)
+            if os.path.exists(filepath) and os.path.getsize(filepath) == total_size and total_size > 0:
+                print(f" [✔] [#{idx}] SKIPPED: Duplicate (Match size: {total_size/(1024*1024):.1f} MB).")
                 return True
                 
-            print(f" [⚡] [#{idx}] DOWNLOADING (Size: {size/(1024*1024):.1f} MB)...")
+            print(f" [⚡] [#{idx}] DOWNLOADING: {total_size/(1024*1024):.1f} MB...")
             
-            # Hard timeout for file download
-            async with asyncio.timeout(300):
+            # Progress-aware download
+            async with asyncio.timeout(600): # 10 mins max per file
                 async with session.get(clean_url) as resp:
                     if resp.status == 200:
+                        downloaded = 0
                         async with aiofiles.open(filepath, 'wb') as f:
-                            async for chunk in resp.content.iter_chunked(1024*1024): 
+                            async for chunk in resp.content.iter_chunked(2*1024*1024): # 2MB chunks
                                 await f.write(chunk)
-                        print(f" [✅] [#{idx}] SUCCESSFULLY ARCHIVED.")
+                                downloaded += len(chunk)
+                                if total_size > 0:
+                                    percent = (downloaded / total_size) * 100
+                                    if idx == 0: # Only show detailed progress for Single mode or pastes
+                                        print(f"       [#{idx}] Progress: {percent:.1f}% ({downloaded/(1024*1024):.1f}MB)", end="\r")
+                        
+                        print(f" [✅] [#{idx}] FINISHED: Saved to {filename}")
                         return True
                     else:
-                        print(f" [!] [#{idx}] SERVER RETURNED STATUS: {resp.status}")
+                        print(f" [✖] [#{idx}] DOWNLOAD ERROR: Status {resp.status}")
                         return False
         except asyncio.TimeoutError:
-            print(f" [✖] [#{idx}] TIMED OUT (Skipping to next).")
+            print(f" [✖] [#{idx}] TIMED OUT (Operation took too long).")
             return False
         except Exception as e:
-            print(f" [✖] [#{idx}] ERROR: {e}")
+            print(f" [✖] [#{idx}] EXCEPTION: {type(e).__name__} - {e}")
             return False
 
     async def worker(self, queue, session):
@@ -106,12 +113,13 @@ class SoraCore:
             
             idx, url = item
             try:
+                # We do not use gather here, workers process tasks independently
                 await self.download_item(session, url, idx)
             finally:
                 queue.task_done()
 
     async def archiver_run(self, urls_with_indices):
-        """Standard Terminal Output (No TQDM to avoid flickering)"""
+        """Standard Terminal Output with Queue Management"""
         queue = asyncio.Queue()
         for item in urls_with_indices:
             await queue.put(item)
@@ -119,17 +127,17 @@ class SoraCore:
         for _ in range(self.concurrency):
             await queue.put(None)
 
-        print(f"\n🚀 ARCHIVER STARTED | CONCURRENCY: {self.concurrency} | BATCH SIZE: {len(urls_with_indices)}")
-        print(f"📂 SAVING TO: {self.out_dir}")
-        print("-" * 50)
+        print(f"\n🚀 SORA ARCHIVER STARTED | BATCH SIZE: {len(urls_with_indices)}")
+        print(f"🛠️  MODE: {'SINGLE' if self.concurrency == 1 else 'MULTI ('+str(self.concurrency)+') workers'}")
+        print("-" * 60)
 
-        # Fix: trust_env belongs to ClientSession, not TCPConnector
-        connector = aiohttp.TCPConnector(limit=self.concurrency)
+        # High-resilience connector for VPN/DNS
+        connector = aiohttp.TCPConnector(limit=self.concurrency, trust_env=True)
         async with aiohttp.ClientSession(connector=connector, trust_env=True) as session:
             workers = [asyncio.create_task(self.worker(queue, session)) 
                        for _ in range(self.concurrency)]
             await asyncio.gather(*workers)
         
-        print("\n" + "=" * 50)
-        print("🎉 BATCH PROCESSING COMPLETE!")
-        print("=" * 50)
+        print("\n" + "=" * 60)
+        print("🎉 BATCH PROCESSING FINISHED!")
+        print("=" * 60)
