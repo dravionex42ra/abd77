@@ -70,6 +70,9 @@ async def main():
             print("No valid indices selected.")
             return
             
+        batch_folder = os.path.splitext(filename)[0]
+        out_dir = os.path.join(OUT_BASE, batch_folder)
+        
         print(f"\n🎬 Archiving {len(indices)} videos to: {out_dir}")
         print("\nChoose Download Mode:")
         print("1. Multi (Parallel - Fast)")
