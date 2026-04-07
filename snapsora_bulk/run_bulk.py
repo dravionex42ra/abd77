@@ -81,13 +81,19 @@ async def main():
     if selected['type'] == 'json':
         try:
             with open(selected['path'], "r", encoding="utf-8") as f:
-                data = json.load(f)
-                # Ensure data is a list
-                if not isinstance(data, list):
-                    data = [data]
+                raw_data = json.load(f)
+                
+                # New Format: {"total_urls": X, "data": [...]}
+                if isinstance(raw_data, dict) and 'data' in raw_data:
+                    items = raw_data['data']
+                # Old Format: [...]
+                elif isinstance(raw_data, list):
+                    items = raw_data
+                else:
+                    items = [raw_data] if isinstance(raw_data, dict) else []
                 
                 # Extract URL field
-                for item in data:
+                for item in items:
                     if isinstance(item, dict) and 'url' in item:
                         urls.append(item['url'].strip().replace('.',''))
         except Exception as e:
