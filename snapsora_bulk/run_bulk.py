@@ -10,10 +10,10 @@ from download_core import VideoArchive
 # Config
 INPUT_DIR = "input"
 JSON_DIR = os.path.join(INPUT_DIR, "json")
-TODW_DIR = "input-todw" # Renamed from inf to match flik
+TODW_DIR = "input-todw"
 LOGS_DIR = "logs"
 DOWNLOAD_DIR = "downloads"
-CONCURRENT_LIMIT = 3 # Increased back for speed
+CONCURRENT_LIMIT = 3
 
 def setup_dirs():
     for d in [INPUT_DIR, JSON_DIR, TODW_DIR, LOGS_DIR, DOWNLOAD_DIR]:
@@ -25,7 +25,6 @@ def list_input_files():
         for f in os.listdir(INPUT_DIR):
             if f.endswith('.txt'):
                 files.append({"name": f, "path": os.path.join(INPUT_DIR, f), "type": "txt"})
-    
     if os.path.exists(JSON_DIR):
         for f in os.listdir(JSON_DIR):
             if f.endswith('.json'):
@@ -41,53 +40,38 @@ def get_next_fail_folder(base_path):
 def log_event(batch_name, event):
     batch_log_dir = os.path.join(LOGS_DIR, batch_name)
     os.makedirs(batch_log_dir, exist_ok=True)
-    
     event_type = "success" if "SUCCESS" in event.get('status', '').upper() or "fetch_ok" in event.get('type','') else "fail"
     log_path = os.path.join(batch_log_dir, f"{event_type}.json")
-    
-    logs = []
-    if os.path.exists(log_path):
-        try:
-            with open(log_path, 'r') as f:
-                logs = json.load(f)
-        except: logs = []
-    
+    logs = load_json_file(log_path)
     event["timestamp"] = datetime.datetime.now().isoformat()
     logs.append(event)
-    
-    with open(log_path, 'w') as f:
-        json.dump(logs, f, indent=4)
+    save_json_file(log_path, logs)
 
 def load_json_file(path):
     if os.path.exists(path):
         try:
-            with open(path, 'r') as f:
-                return json.load(f)
+            with open(path, 'r', encoding='utf-8') as f: return json.load(f)
         except: return []
     return []
 
 def save_json_file(path, data):
-    with open(path, 'w') as f:
-        json.dump(data, f, indent=4)
+    with open(path, 'w', encoding='utf-8') as f: json.dump(data, f, indent=4)
 
 async def fetch_and_display(session, url, index, batch_name):
     print(f"[*] Fetching Video {index} details...")
-    mp4_url, video_data = await SnapsoraFetcher.get_direct_link(session, url)
+    try:
+        mp4_url, video_data = await SnapsoraFetcher.get_direct_link(session, url)
+        if mp4_url and video_data:
+            title = video_data.get('title') or ""
+            print(f"    [OK] Title: {str(title)[:40]}...")
+            log_event(batch_name, {"type": "fetch_ok", "id": index, "url": url})
+            return {"number": index, "input_link": url, "fetched_link": mp4_url, "title": title}
+    except Exception as e:
+        print(f"    [!] API Error: {str(e)[:50]}")
     
-    if mp4_url and video_data:
-        title = video_data.get('title', f"video_{index:03d}")
-        print(f"    [OK] Title: {title[:40]}...")
-        log_event(batch_name, {"type": "fetch_ok", "id": index, "url": url})
-        return {
-            "number": index,
-            "input_link": url, 
-            "fetched_link": mp4_url,
-            "title": title
-        }
-    else:
-        print(f"    [FAIL] Could not fetch: {url[:50]}...")
-        log_event(batch_name, {"type": "fetch_fail", "id": index, "url": url})
-        return None
+    print(f"    [FAIL] Could not fetch: {url[:50]}")
+    log_event(batch_name, {"type": "fetch_fail", "id": index, "url": url})
+    return None
 
 async def main():
     setup_dirs()
@@ -96,7 +80,10 @@ async def main():
         print(f"\n[!] Error: No files in '{INPUT_DIR}/'.")
         return
 
-    print(f"\n--- Snapsora Bulk V5 (Retry & Precision Edition) ---")
+    print(f"\n" + "="*50)
+    print(f"   SNAPSORA BULK V5 (DEEP RESUME EDITION)")
+    print(f"="*50)
+
     for i, file in enumerate(files, 1):
         lbl = "[TXT]" if file['type'] == "txt" else "[JSON]"
         print(f"{i}. {lbl} {file['name']}")
@@ -108,110 +95,101 @@ async def main():
 
     pure_name = os.path.splitext(selected['name'])[0]
     batch_name = f"{pure_name}_js" if selected['type'] == 'json' else pure_name
-    
     todw_path = os.path.join(TODW_DIR, f"{batch_name}.json")
     metadata = load_json_file(todw_path)
     
-    # Identify pending or failed links from previous session
-    # (Items that are not in metadata OR have no fetched_link)
-    mode = "normal"
-    has_failures = any(not m.get('fetched_link') for m in metadata)
-    
-    if metadata and has_failures:
-        print(f"\n[!] ALERT: Found previously failed links.")
-        print("[1] Download ALL links (Normal)")
-        print("[2] Retry FAILED links only (Recovery)")
-        if input("\nChoice: ").strip() == "2":
-            mode = "retry"
+    # 1. Session Management (Resume vs Restart)
+    mode = "resume"
+    if metadata:
+        print(f"\n[!] ALERT: Previous session for '{batch_name}' detected.")
+        print("[1] Resume Session (Skip already fetched)")
+        print("[2] Restart Session (Discard all progress)")
+        if input("\nEnter choice [1 or 2]: ").strip() == "2":
+            mode = "restart"
+            print("[i] Restarting... backing up old metadata.")
+            shutil.copy(todw_path, todw_path + ".bak")
+            metadata = []
+            save_json_file(todw_path, metadata)
 
-    # Load Source URLs for this batch
-    all_source_links = []
+    # 2. Load Source Links
+    all_source = []
     if selected['type'] == 'json':
         with open(selected['path'], "r", encoding="utf-8") as f:
-            data = json.load(f)
-            data = data['data'] if isinstance(data, dict) and 'data' in data else data
-            if not isinstance(data, list): data = [data]
-            all_source_links = [{"number": i+1, "url": d['url'].strip()} for i, d in enumerate(data) if 'url' in d]
+            data = json.load(f).get('data', [])
+            all_source = [{"number": i+1, "url": d['url'].strip()} for i, d in enumerate(data) if 'url' in d]
     else:
         with open(selected['path'], "r", encoding="utf-8") as f:
-            all_source_links = [{"number": i+1, "url": l.strip()} for i, l in enumerate(f) if l.strip()]
+            all_source = [{"number": i+1, "url": l.strip()} for i, l in enumerate(f) if l.strip()]
 
-    # Filter links to process
-    target_tasks = []
-    if mode == "retry":
-        target_tasks = [m for m in metadata if not m.get('fetched_link')]
-    else:
-        # Normal mode: process links not in metadata or incomplete
-        processed_urls = {m['input_link'] for m in metadata if m.get('fetched_link')}
-        target_tasks = [L for L in all_source_links if L['url'] not in processed_urls]
+    # Filter links that need fetching
+    processed_urls = {m['input_link'] for m in metadata if m.get('fetched_link')}
+    links_to_fetch = [L for L in all_source if L['url'] not in processed_urls]
 
-    if not target_tasks:
-        print("\n[i] All links are already processed!")
-        return
-
-    # Setup Download Paths
-    batch_final_root = os.path.join(DOWNLOAD_DIR, batch_name)
-    current_dest_dir = batch_final_root
-    if mode == "retry":
-        fail_sub = get_next_fail_folder(batch_final_root)
-        current_dest_dir = os.path.join(batch_final_root, fail_sub)
-    
-    os.makedirs(current_dest_dir, exist_ok=True)
-
+    # 3. Step 1: Fetch Phase
     async with aiohttp.ClientSession() as session:
-        print(f"\n[Step 1] Intercepting {len(target_tasks)} links (Parallel Mode)...")
-        
-        sem_fetch = asyncio.Semaphore(CONCURRENT_LIMIT)
-        
-        async def fetch_job(task):
-            async with sem_fetch:
-                t_url = task.get('url') or task.get('input_link')
-                t_num = task.get('number')
-                v = await fetch_and_display(session, t_url, t_num, batch_name)
-                if v:
-                    # Update metadata real-time - unique by number
-                    nonlocal metadata
-                    metadata = [m for m in metadata if m['number'] != t_num]
-                    metadata.append(v)
-                    save_json_file(todw_path, metadata)
-                return v
+        if links_to_fetch:
+            print(f"\n[Step 1] Fetching {len(links_to_fetch)} new/missing links...")
+            sem_fetch = asyncio.Semaphore(CONCURRENT_LIMIT)
+            
+            async def fetch_job(task):
+                async with sem_fetch:
+                    v = await fetch_and_display(session, task['url'], task['number'], batch_name)
+                    if v:
+                        nonlocal metadata
+                        metadata = [m for m in metadata if m['number'] != v['number']]
+                        metadata.append(v)
+                        save_json_file(todw_path, metadata)
+                    return v
 
-        # Run Parallel Fetch
-        session_results = await asyncio.gather(*[fetch_job(t) for t in target_tasks])
-        session_successes = [v for v in session_results if v]
+            await asyncio.gather(*[fetch_job(t) for t in links_to_fetch])
+        else:
+            print(f"\n[i] Step 1 Skipped: All {len(all_source)} links already captured.")
 
-        if not session_successes:
-            print("\n[!] No new videos fetched.")
+        # 4. Step 2: Download Phase
+        # Success is defined as any link we have a direct MP4 for
+        success_list = [m for m in metadata if m.get('fetched_link')]
+        if not success_list:
+            print("\n[!] Nothing fetched. Check your internet/API.")
             return
 
-        print(f"\n[Step 2] Total {len(session_successes)} videos ready.")
-        input(f"\n--- Press [ENTER] to start Parallel Download ({current_dest_dir}) ---")
-
-        sem = asyncio.Semaphore(CONCURRENT_LIMIT)
+        # Folder management
+        batch_root = os.path.join(DOWNLOAD_DIR, batch_name)
+        # Check if we should use a fail subfolder (only if retrying manually)
+        current_dest = batch_root
+        # Note: In deep resume, we don't necessarily need fail1/fail2 unless user wants it.
+        # But we'll keep the option for "only failures" if they exist.
+        failures = [m for m in all_source if m['url'] not in processed_urls]
         
-        async def download_task(video):
-            async with sem:
-                clean_title = "".join(c for c in video['title'] if c.isalnum() or c in (' ', '_', '-')).strip()
-                filename = f"{video['number']:03d}_{clean_title[:30]}.mp4"
-                output_path = os.path.join(current_dest_dir, filename)
+        os.makedirs(current_dest, exist_ok=True)
+        print(f"\n[Step 2] Total {len(success_list)} videos ready.")
+        input(f"\n--- Press [ENTER] to start Parallel Download ({current_dest}) ---")
+
+        sem_dw = asyncio.Semaphore(CONCURRENT_LIMIT)
+        async def download_job(video):
+            async with sem_dw:
+                raw_title = str(video.get('title') or "")
+                clean_t = "".join(c for c in raw_title if c.isalnum() or c in (' ', '_', '-')).strip()
+                fname = f"{video['number']:03d}_{clean_t[:30]}.mp4"
+                fpath = os.path.join(current_dest, fname)
                 
-                status, size = await VideoArchive.stream_download(session, video['fetched_link'], output_path)
-                
-                if status:
-                    log_event(batch_name, {"status": "SUCCESS", "number": video['number'], "file": filename, "url": video['input_link']})
+                # Double check if file exists and is complete
+                if os.path.exists(fpath):
+                    print(f"  [i] Already exists: {fname}")
                     return True
+                
+                res, size = await VideoArchive.stream_download(session, video['fetched_link'], fpath)
+                if res:
+                    log_event(batch_name, {"status": "SUCCESS", "number": video['number'], "file": fname, "url": video['input_link']})
                 else:
-                    log_event(batch_name, {"status": "FAIL", "number": video['number'], "file": filename, "url": video['input_link']})
-                    return False
+                    log_event(batch_name, {"status": "FAIL", "number": video['number'], "file": fname, "url": video['input_link']})
+                return res
 
-        print(f"\n[Step 3] Downloading to {current_dest_dir}...")
-        results = await asyncio.gather(*[download_task(v) for v in session_successes])
-        
-        print(f"\n" + "="*50)
-        print(f"   SESSION COMPLETE")
-        print(f"   Success: {sum(1 for r in results if r)}")
-        print(f"   Download Path: {current_dest_dir}")
-        print("="*50)
+        await asyncio.gather(*[download_job(v) for v in success_list])
+
+    print("\n" + "="*50)
+    print(f"   SESSION COMPLETE (Mode: {mode.upper()})")
+    print(f"   Project: {batch_name}")
+    print("="*50)
 
 if __name__ == "__main__":
     asyncio.run(main())
