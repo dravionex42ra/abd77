@@ -2,38 +2,33 @@ import asyncio
 import os
 import aiohttp
 import json
+import shutil
 from api import SnapsoraFetcher
 from download_core import VideoArchive
 
 # Config
 INPUT_DIR = "input"
 JSON_DIR = os.path.join(INPUT_DIR, "json")
+FAIL_DIR = os.path.join(INPUT_DIR, "fail")
 DOWNLOAD_DIR = "downloads"
-CONCURRENT_LIMIT = 3
+CONCURRENT_LIMIT = 2 # Reduced for stability in Termux
 
 def get_all_input_files():
     """
     Scans input/ and input/json/ for .txt and .json files.
-    Returns a unified list of (filename, path, type).
     """
     files = []
-    
-    # 1. Scan for .txt in input/
     if os.path.exists(INPUT_DIR):
         for f in os.listdir(INPUT_DIR):
             if f.endswith('.txt'):
                 files.append({"name": f, "path": os.path.join(INPUT_DIR, f), "type": "txt"})
-    else:
-        os.makedirs(INPUT_DIR, exist_ok=True)
-                
-    # 2. Scan for .json in input/json/
-    if os.path.exists(JSON_DIR):
-        for f in os.listdir(JSON_DIR):
-            if f.endswith('.json'):
-                files.append({"name": f, "path": os.path.join(JSON_DIR, f), "type": "json"})
-    else:
-        os.makedirs(JSON_DIR, exist_ok=True)
-        
+    else: os.makedirs(INPUT_DIR, exist_ok=True)
+    if not os.path.exists(JSON_DIR): os.makedirs(JSON_DIR, exist_ok=True)
+    if not os.path.exists(FAIL_DIR): os.makedirs(FAIL_DIR, exist_ok=True)
+    
+    for f in os.listdir(JSON_DIR):
+        if f.endswith('.json'):
+            files.append({"name": f, "path": os.path.join(JSON_DIR, f), "type": "json"})
     return files
 
 async def fetch_and_display(session, url, index):
@@ -42,93 +37,64 @@ async def fetch_and_display(session, url, index):
     """
     print(f"[*] Fetching Video {index} details...")
     mp4_url, video_data = await SnapsoraFetcher.get_direct_link(session, url)
-    
     if mp4_url and video_data:
         title = video_data.get('title', f"video_{index:03d}")
         print(f"    [OK] Title: {title[:50]}...")
-        return {"url": mp4_url, "title": title, "id": index}
+        return {"url": mp4_url, "title": title, "id": index, "original_url": url}
     else:
         print(f"    [FAIL] Could not fetch data for: {url}")
         return None
 
 async def main():
-    # 1. Scanning Input Files
     files = get_all_input_files()
-    
     if not files:
-        print(f"\n[!] Error: No .txt or .json files found in '{INPUT_DIR}/' or '{JSON_DIR}/'.")
-        print(f"    Please paste your URL files there first.")
+        print(f"\n[!] Error: No files in '{INPUT_DIR}/'.")
         return
 
-    print(f"\n--- Snapsora Bulk: Select Batch File ---")
+    print(f"\n--- Snapsora Bulk V4: Select Batch ---")
     for i, file in enumerate(files, 1):
-        type_label = "[TXT]" if file['type'] == "txt" else "[JSON]"
-        print(f"{i}. {type_label} {file['name']}")
+        lbl = "[TXT]" if file['type'] == "txt" else "[JSON]"
+        print(f"{i}. {lbl} {file['name']}")
     
     try:
-        choice = int(input(f"\nEnter file number (1-{len(files)}): "))
-        if not (1 <= choice <= len(files)):
-            raise ValueError
+        choice = int(input(f"\nEnter batch number (1-{len(files)}): "))
         selected = files[choice-1]
-    except (ValueError, IndexError):
-        print("[!] Invalid selection. Exiting.")
-        return
+    except (ValueError, IndexError): return
 
-    # 2. Loading URLs based on Type
+    # Load URLs
     urls = []
-    print(f"\n[Selected: {selected['name']}] Loading URLs...")
-    
     if selected['type'] == 'json':
-        try:
-            with open(selected['path'], "r", encoding="utf-8") as f:
-                raw_data = json.load(f)
-                
-                # New Format: {"total_urls": X, "data": [...]}
-                if isinstance(raw_data, dict) and 'data' in raw_data:
-                    items = raw_data['data']
-                # Old Format: [...]
-                elif isinstance(raw_data, list):
-                    items = raw_data
-                else:
-                    items = [raw_data] if isinstance(raw_data, dict) else []
-                
-                # Extract URL field
-                for item in items:
-                    if isinstance(item, dict) and 'url' in item:
-                        urls.append(item['url'].strip().replace('.',''))
-        except Exception as e:
-            print(f"[!] Error reading JSON: {str(e)}")
-            return
+        with open(selected['path'], "r", encoding="utf-8") as f:
+            data = json.load(f)
+            data = data['data'] if isinstance(data, dict) and 'data' in data else data
+            if not isinstance(data, list): data = [data]
+            urls = [d['url'].strip().replace('.','') for d in data if 'url' in d]
     else:
         with open(selected['path'], "r", encoding="utf-8") as f:
-            urls = [line.strip().replace('.','') for line in f if line.strip()]
+            urls = [l.strip().replace('.','') for l in f if l.strip()]
 
-    if not urls:
-        print(f"[!] Error: No URLs found in '{selected['name']}'. Check file content.")
-        return
+    if not urls: return
 
-    # 3. Setup Subfolder for this Batch
+    # Setup Paths
     batch_name = os.path.splitext(selected['name'])[0]
     batch_download_dir = os.path.join(DOWNLOAD_DIR, batch_name)
     os.makedirs(batch_download_dir, exist_ok=True)
+    
+    # Sub-folder for partial failures
+    batch_fail_folder = os.path.join(batch_download_dir, "fail")
+    os.makedirs(batch_fail_folder, exist_ok=True)
 
-    print(f"Found {len(urls)} URLs. Starting session...")
+    failed_links = []
     
     async with aiohttp.ClientSession() as session:
-        print(f"\n[Step 1] Fetching video list (titles/links)...")
+        print(f"\n[Step 1] Fetching video list...")
         tasks = [fetch_and_display(session, url, i) for i, url in enumerate(urls, 1)]
-        video_list = await asyncio.gather(*tasks)
+        video_list = [v for v in await asyncio.gather(*tasks) if v]
         
-        video_list = [v for v in video_list if v]
-        
-        if not video_list:
-            print("\n[!] No videos were successfully fetched. Check your URLs.")
-            return
-
+        if not video_list: return
         print(f"\n[Step 2] Total {len(video_list)} videos ready.")
-        input(f"\n--- Press [ENTER] to start Download ALL to /downloads/{batch_name}/ ---")
+        input(f"\n--- Press [ENTER] to start 'Download ALL' (Stability V4 Mode) ---")
 
-        # 4. Direct streaming to dedicated subfolder
         sem = asyncio.Semaphore(CONCURRENT_LIMIT)
         
         async def download_task(video):
@@ -136,13 +102,32 @@ async def main():
                 clean_title = "".join(c for c in video['title'] if c.isalnum() or c in (' ', '_', '-')).strip()
                 filename = f"{video['id']:03d}_{clean_title[:30]}.mp4"
                 output_path = os.path.join(batch_download_dir, filename)
-                return await VideoArchive.stream_download(session, video['url'], output_path)
+                
+                # Check for resume and download
+                status, size = await VideoArchive.stream_download(session, video['url'], output_path)
+                
+                if not status: # Still fails after retries
+                    failed_links.append(video['original_url'])
+                    # Move partial file to fail folder
+                    if os.path.exists(output_path):
+                        dest_fail_path = os.path.join(batch_fail_folder, filename)
+                        shutil.move(output_path, dest_fail_path)
+                    return False
+                return True
 
         print(f"\n[Step 3] Downloading All to '{batch_download_dir}/' folder...")
-        download_tasks = [download_task(v) for v in video_list]
-        await asyncio.gather(*download_tasks)
+        results = await asyncio.gather(*[download_task(v) for v in video_list])
 
-        print(f"\n--- SESSION COMPLETE ---")
+        # Logging Failures
+        if failed_links:
+            fail_file_path = os.path.join(FAIL_DIR, f"{batch_name}_failed.txt")
+            with open(fail_file_path, "w") as f:
+                f.write("\n".join(failed_links))
+            print(f"\n[!] WARNING: {len(failed_links)} videos failed after all retries.")
+            print(f"    Failed links saved in: {fail_file_path}")
+            print(f"    Partial files moved to: {batch_fail_folder}/")
+        
+        print(f"\n--- SESSION COMPLETE (Total: {len(video_list)} | Success: {sum(1 for r in results if r)}) ---")
 
 if __name__ == "__main__":
     asyncio.run(main())

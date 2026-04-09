@@ -1,22 +1,21 @@
 import aiohttp
 import aiofiles
 import os
+import asyncio
 from tqdm.asyncio import tqdm
 
 class VideoArchive:
     """
-    Streaming downloader with smart duplicate handling.
+    Advanced streaming downloader with Auto-Resume and Retry support.
     """
     
     @staticmethod
     def _get_unique_path(path):
         """
-        If file exists, appends #1, #2, etc. to the filename before the extension.
-        Example: video.mp4 -> video#1.mp4
+        Handles duplicates by appending #1, #2, etc. (Not used for resume).
         """
         if not os.path.exists(path):
             return path
-            
         base, ext = os.path.splitext(path)
         counter = 1
         while True:
@@ -26,41 +25,66 @@ class VideoArchive:
             counter += 1
 
     @staticmethod
-    async def stream_download(session, mp4_url, output_path):
+    async def stream_download(session, mp4_url, output_path, retries=3):
         """
-        Saves the video chunks directly to the specified path with a progress bar.
-        Handles duplicates by renaming.
+        Downloads a video with 'Range' resume support and automatic retries.
         """
-        try:
-            # Ensure folder exists
-            os.makedirs(os.path.dirname(output_path), exist_ok=True)
+        # Ensure directory exists
+        os.makedirs(os.path.dirname(output_path), exist_ok=True)
+        
+        # Check if we should resume
+        current_size = 0
+        if os.path.exists(output_path):
+            current_size = os.path.getsize(output_path)
             
-            # Smart Renaming for duplicates
-            final_path = VideoArchive._get_unique_path(output_path)
+        for attempt in range(retries):
+            try:
+                headers = {}
+                if current_size > 0:
+                    headers = {'Range': f'bytes={current_size}-'}
+                
+                async with session.get(mp4_url, headers=headers, timeout=60) as response:
+                    # 206 means partial content (Resuming), 200 means full download
+                    if response.status in (200, 206):
+                        total_size = int(response.headers.get('content-length', 0)) + current_size
+                        
+                        # Fix for servers that don't support Range (Restart from 0)
+                        mode = 'ab' if response.status == 206 else 'wb'
+                        if response.status == 200:
+                            current_size = 0
+                        
+                        filename = os.path.basename(output_path)
+                        pbar = tqdm(
+                            total=total_size,
+                            initial=current_size,
+                            unit='B',
+                            unit_scale=True,
+                            desc=f"Download {filename[:20]}...",
+                            leave=False
+                        )
+                        
+                        async with aiofiles.open(output_path, mode=mode) as f:
+                            async for chunk in response.content.iter_chunked(1024 * 1024): # 1MB chunk
+                                await f.write(chunk)
+                                current_size += len(chunk)
+                                pbar.update(len(chunk))
+                        
+                        pbar.close()
+                        return True, current_size # Success
+                        
+                    elif response.status == 416: # Range not satisfiable (might be finished)
+                        print(f"(!) {os.path.basename(output_path)} might already be complete (HTTP 416).")
+                        return True, current_size
+                    else:
+                        print(f"(!) Attempt {attempt+1} failed: Status {response.status}")
+                
+            except (aiohttp.ClientError, asyncio.TimeoutError) as e:
+                print(f"(!) Attempt {attempt+1} network error for {os.path.basename(output_path)}: {str(e)}")
+            except Exception as e:
+                print(f"(!) Unexpected error on attempt {attempt+1}: {str(e)}")
             
-            async with session.get(mp4_url, timeout=45) as response:
-                if response.status == 200:
-                    file_size = int(response.headers.get('content-length', 0))
-                    
-                    filename = os.path.basename(final_path)
-                    progress_bar = tqdm(
-                        total=file_size,
-                        unit='B',
-                        unit_scale=True,
-                        desc=f"Downloading {filename[:25]}...",
-                        leave=False
-                    )
-                    
-                    async with aiofiles.open(final_path, mode='wb') as f:
-                        async for chunk in response.content.iter_chunked(1024 * 1024):
-                            await f.write(chunk)
-                            progress_bar.update(len(chunk))
-                    
-                    progress_bar.close()
-                    return True
-                else:
-                    print(f"Download Error: Status {response.status} for {mp4_url}")
-                    return False
-        except Exception as e:
-            print(f"Exception during download: {str(e)}")
-            return False
+            # Wait before retry (Exponential backoff)
+            if attempt < retries - 1:
+                await asyncio.sleep(2 * (attempt + 1))
+        
+        return False, current_size # Failed after all retries
