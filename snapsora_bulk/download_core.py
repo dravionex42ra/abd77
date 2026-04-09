@@ -2,6 +2,7 @@ import aiohttp
 import aiofiles
 import os
 import asyncio
+import shutil
 from tqdm.asyncio import tqdm
 
 class VideoArchive:
